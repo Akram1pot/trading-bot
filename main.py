@@ -1,14 +1,12 @@
-import ccxt
 import requests
 import os
 from datetime import datetime
-from dataclasses import dataclass
 
-# ============= Telegram Configuration =============
+# ============= Configuration =============
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = "362387912"
 
-# ============= Telegram Bot Class =============
+# ============= Telegram Bot =============
 class TelegramBot:
     def __init__(self, token, chat_id):
         self.url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -18,111 +16,114 @@ class TelegramBot:
         try:
             requests.post(self.url, json={"chat_id": self.chat_id, "text": text, "parse_mode": "HTML"}, timeout=10)
             return True
-        except:
+        except Exception as e:
+            print(f"Telegram error: {e}")
             return False
 
-# ============= Guardrails =============
-@dataclass
-class TradingGuardrails:
-    min_trade_usd: float = 10.0
-    max_trade_usd: float = 100.0
+# ============= CoinGecko API (Free, No Geo-Restrictions) =============
+def get_btc_data():
+    """جلب بيانات البيتكوين من CoinGecko"""
+    url = "https://api.coingecko.com/api/v3/coins/bitcoin"
+    params = {
+        "localization": "false",
+        "tickers": "false",
+        "community_data": "false",
+        "developer_data": "false"
+    }
+    response = requests.get(url, params=params, timeout=30)
+    response.raise_for_status()
+    return response.json()
 
-class ActionValidator:
-    @staticmethod
-    def validate(action, guardrails):
-        if action.get('type') not in ['BUY', 'SELL', 'HOLD']:
-            return False, "نوع إجراء غير صالح"
-        if action['type'] == 'HOLD':
-            return True, "HOLD مسموح دائماً"
-        value = action.get('order_value_usd', 0)
-        if value < 0:
-            return False, "قيمة سالبة"
-        if value < guardrails.min_trade_usd or value > guardrails.max_trade_usd:
-            return False, "خارج الحدود"
-        if action.get('symbol') not in ['BTC/USDT', 'PAXG/USDT']:
-            return False, "رمز غير مدعوم"
-        return True, "صالح"
-
-# ============= Technical Analysis Provider =============
-class TechnicalAnalysisProvider:
-    def propose(self, data):
-        rsi = data.get('rsi', 50)
-        macd = data.get('macd', 0)
-        price = data.get('price', 0)
-        ema_9 = data.get('ema_9', 0)
-        
-        if rsi < 30 and macd > 0 and price > ema_9:
-            return {"type": "BUY", "symbol": "BTC/USDT", "order_value_usd": 50,
-                    "reason": f"RSI منخفض ({rsi:.1f}) + MACD إيجابي", "confidence": 0.85}
-        elif rsi > 70 and macd < 0:
-            return {"type": "SELL", "symbol": "BTC/USDT", "order_value_usd": 50,
-                    "reason": f"RSI مرتفع ({rsi:.1f}) + MACD سلبي", "confidence": 0.80}
-        else:
-            return {"type": "HOLD", "symbol": "BTC/USDT", "order_value_usd": 0,
-                    "reason": "لا إشارة واضحة", "confidence": 0.50}
-
-# ============= Helpers =============
-def calc_ema(prices, period):
-    m = 2 / (period + 1)
-    ema = prices[0]
-    for p in prices[1:]:
-        ema = (p - ema) * m + ema
-    return ema
-
-def calc_macd(prices):
-    return calc_ema(prices, 12) - calc_ema(prices, 26)
-
-def calc_rsi(candles, period=14):
-    closes = [c[4] for c in candles]
+def calculate_rsi_from_history(coin_id, days=14):
+    """حساب RSI تقريبي من تاريخ الأسعار"""
+    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
+    params = {"vs_currency": "usd", "days": days}
+    response = requests.get(url, params=params, timeout=30)
+    response.raise_for_status()
+    data = response.json()
+    prices = [p[1] for p in data['prices']]
+    
+    if len(prices) < 15:
+        return 50.0
+    
     gains, losses = [], []
-    for i in range(1, len(closes)):
-        ch = closes[i] - closes[i-1]
-        gains.append(ch if ch > 0 else 0)
-        losses.append(abs(ch) if ch < 0 else 0)
-    ag = sum(gains[-period:]) / period
-    al = sum(losses[-period:]) / period
-    if al == 0: return 100
-    return 100 - (100 / (1 + ag/al))
+    for i in range(1, len(prices)):
+        change = prices[i] - prices[i-1]
+        gains.append(max(0, change))
+        losses.append(max(0, -change))
+    
+    avg_gain = sum(gains[-14:]) / 14
+    avg_loss = sum(losses[-14:]) / 14
+    
+    if avg_loss == 0:
+        return 100.0
+    
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
 
-# ============= Main =============
-def analyze_and_notify():
-    guardrails = TradingGuardrails()
-    validator = ActionValidator()
-    provider = TechnicalAnalysisProvider()
-    tg = TelegramBot(TELEGRAM_TOKEN, CHAT_ID)
+# ============= Trading Logic =============
+def analyze():
+    print("Fetching BTC data from CoinGecko...")
+    data = get_btc_data()
     
-    exchange = ccxt.binance({'enableRateLimit': True})
-    candles = exchange.fetch_ohlcv('BTC/USDT', timeframe='1h', limit=100)
-    ticker = exchange.fetch_ticker('BTC/USDT')
+    price = data['market_data']['current_price']['usd']
+    change_24h = data['market_data']['price_change_percentage_24h']
+    high_24h = data['market_data']['high_24h']['usd']
+    low_24h = data['market_data']['low_24h']['usd']
+    market_cap = data['market_data']['market_cap']['usd']
     
-    price = ticker['last']
-    closes = [c[4] for c in candles]
-    rsi = calc_rsi(candles, 14)
-    macd = calc_macd(closes)
-    ema_9 = calc_ema(closes[-20:], 9)
-    ema_21 = calc_ema(closes[-30:], 21)
+    print(f"Price: ${price:,.2f}")
+    print(f"24h Change: {change_24h:.2f}%")
     
-    action = provider.propose({'rsi': rsi, 'macd': macd, 'price': price, 'ema_9': ema_9, 'symbol': 'BTC/USDT'})
-    is_valid, reason = validator.validate(action, guardrails)
+    # حساب RSI تقريبي
+    rsi = calculate_rsi_from_history('bitcoin', 14)
+    print(f"RSI (14-day approx): {rsi:.2f}")
     
-    emoji = {"BUY": "", "SELL": "🔴"}.get(action['type'], "🟡")
-    v = "✅" if is_valid else "❌"
+    # قرار التداول
+    if rsi < 30:
+        decision = "BUY"
+        emoji = ""
+        reason = f"RSI منخفض ({rsi:.1f}) - تشبع بيعي"
+        confidence = 0.80
+    elif rsi > 70:
+        decision = "SELL"
+        emoji = ""
+        reason = f"RSI مرتفع ({rsi:.1f}) - تشبع شرائي"
+        confidence = 0.80
+    else:
+        decision = "HOLD"
+        emoji = "🟡"
+        reason = "منطقة محايدة - انتظر إشارة أوضح"
+        confidence = 0.50
     
+    # رسالة Telegram
     msg = f"""
- <b>BTC/USDT Analysis</b>
-━━━━━━━━━━━━━━━
-💰 Price: ${price:,.2f}
-📈 RSI: {rsi:.2f} | MACD: {macd:.2f}
- EMA 9: ${ema_9:,.2f} | EMA 21: ${ema_21:,.2f}
-━━━━━━━━━━━━━━━
-{emoji} Decision: {action['type']}
- Reason: {action['reason']}
-🎯 Confidence: {action['confidence']*100:.0f}%
-🛡️ Validation: {v} {reason}
- {datetime.now().strftime('%Y-%m-%d %H:%M')}
+{emoji} <b>BTC/USDT Analysis</b>
+━━━━━━━━━━━━━━━━━━━━
+💰 <b>Price:</b> ${price:,.2f}
+📈 <b>24h Change:</b> {change_24h:+.2f}%
+🔺 <b>24h High:</b> ${high_24h:,.2f}
+🔻 <b>24h Low:</b> ${low_24h:,.2f}
+💎 <b>Market Cap:</b> ${market_cap/1e9:.1f}B
+
+━━━━━━━━━━━━━━━━━━━━
+ <b>RSI (14-day):</b> {rsi:.2f}
+{emoji} <b>Decision:</b> {decision}
+📝 <b>Reason:</b> {reason}
+🎯 <b>Confidence:</b> {confidence*100:.0f}%
+
+⏰ {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}
 """
-    tg.send(msg)
-    print(f"Analysis: {action['type']} | Price: ${price:,.2f}")
+    
+    tg = TelegramBot(TELEGRAM_TOKEN, CHAT_ID)
+    success = tg.send(msg)
+    
+    if success:
+        print("✅ Telegram notification sent!")
+    else:
+        print("❌ Failed to send Telegram notification")
+    
+    print(f"\nFinal Decision: {decision}")
 
 if __name__ == "__main__":
-    analyze_and_notify()
+    analyze()
