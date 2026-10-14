@@ -1,12 +1,14 @@
 import requests
 import os
 import csv
+import json
 from datetime import datetime
 
 # ============= Configuration =============
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = "362387912"
 LOG_FILE = "trading_log.csv"
+STATE_FILE = "last_state.json"
 
 # ============= Telegram Bot =============
 class TelegramBot:
@@ -60,13 +62,53 @@ def get_decision(rsi):
     if rsi < 30:
         return "BUY", "🟢", f"RSI منخفض ({rsi:.1f})", 0.80
     elif rsi > 70:
-        return "SELL", "🔴", f"RSI مرتفع ({rsi:.1f})", 0.80
+        return "SELL", "", f"RSI مرتفع ({rsi:.1f})", 0.80
     else:
         return "HOLD", "🟡", "منطقة محايدة", 0.50
 
+# ============= State Management =============
+def load_state():
+    """تحميل آخر حالة محفوظة"""
+    if os.path.isfile(STATE_FILE):
+        with open(STATE_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {}
+
+def save_state(state):
+    """حفظ الحالة الحالية"""
+    with open(STATE_FILE, 'w', encoding='utf-8') as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+def should_send_alert(coin, price, rsi, decision, last_state):
+    """تحديد ما إذا كان يجب إرسال تنبيه"""
+    
+    # إذا لم توجد حالة سابقة، أرسل دائماً (أول تشغيل)
+    if coin not in last_state:
+        return True, "أول تشغيل"
+    
+    last = last_state[coin]
+    last_price = last['price']
+    last_decision = last['decision']
+    last_rsi = last['rsi']
+    
+    # الشرط 1: تغير القرار (HOLD → BUY/SELL أو العكس)
+    if decision != last_decision:
+        return True, f"تغير القرار من {last_decision} إلى {decision}"
+    
+    # الشرط 2: RSI في منطقة حرجة
+    if rsi < 30 or rsi > 70:
+        return True, f"RSI حرج ({rsi:.1f})"
+    
+    # الشرط 3: تغير السعر أكثر من 3%
+    price_change_pct = abs(price - last_price) / last_price * 100
+    if price_change_pct > 3.0:
+        return True, f"تغير السعر {price_change_pct:.2f}%"
+    
+    # لا تنبيه
+    return False, None
+
 # ============= Logging =============
 def log_decision(coin, price, rsi, decision, reason, confidence):
-    """تسجيل القرار في ملف CSV"""
     file_exists = os.path.isfile(LOG_FILE)
     
     with open(LOG_FILE, 'a', newline='', encoding='utf-8') as f:
@@ -90,6 +132,9 @@ def log_decision(coin, price, rsi, decision, reason, confidence):
 def analyze():
     print("Fetching BTC and PAXG data...")
     
+    # تحميل آخر حالة
+    last_state = load_state()
+    
     # البيتكوين
     btc_data = get_coin_data('bitcoin')
     btc_price = btc_data['market_data']['current_price']['usd']
@@ -102,22 +147,44 @@ def analyze():
     paxg_rsi = calculate_rsi('pax-gold', 14)
     paxg_decision, paxg_emoji, paxg_reason, paxg_conf = get_decision(paxg_rsi)
     
-    # تسجيل القرارات في CSV
+    # تسجيل القرارات في CSV (دائماً)
     log_decision('BTC', btc_price, btc_rsi, btc_decision, btc_reason, btc_conf)
     log_decision('PAXG', paxg_price, paxg_rsi, paxg_decision, paxg_reason, paxg_conf)
     
-    # إرسال إلى Telegram
+    # التحقق من التنبيهات الذكية
+    btc_alert, btc_alert_reason = should_send_alert('BTC', btc_price, btc_rsi, btc_decision, last_state)
+    paxg_alert, paxg_alert_reason = should_send_alert('PAXG', paxg_price, paxg_rsi, paxg_decision, last_state)
+    
     tg = TelegramBot(TELEGRAM_TOKEN, CHAT_ID)
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M UTC')
     
-    msg = f"""
-{btc_emoji} <b>BTC:</b> ${btc_price:,.0f} | RSI: {btc_rsi:.1f} | {btc_decision}
-{paxg_emoji} <b>GOLD:</b> ${paxg_price:,.0f} | RSI: {paxg_rsi:.1f} | {paxg_decision}
-⏰ {timestamp}
-"""
+    # إرسال فقط إذا كان هناك تنبيه
+    if btc_alert or paxg_alert:
+        alert_lines = []
+        
+        if btc_alert:
+            alert_lines.append(f"🚨 <b>BTC ALERT:</b> {btc_alert_reason}")
+            alert_lines.append(f"{btc_emoji} <b>BTC:</b> ${btc_price:,.0f} | RSI: {btc_rsi:.1f} | {btc_decision}")
+        
+        if paxg_alert:
+            alert_lines.append(f"🚨 <b>GOLD ALERT:</b> {paxg_alert_reason}")
+            alert_lines.append(f"{paxg_emoji} <b>GOLD:</b> ${paxg_price:,.0f} | RSI: {paxg_rsi:.1f} | {paxg_decision}")
+        
+        alert_lines.append(f" {timestamp}")
+        
+        msg = "\n".join(alert_lines)
+        success = tg.send(msg)
+        print(f"🚨 Alert sent: {success}")
+    else:
+        print("💤 No alert needed - market stable")
     
-    success = tg.send(msg)
-    print(f"✅ Sent" if success else "❌ Failed")
+    # حفظ الحالة الجديدة
+    new_state = {
+        'BTC': {'price': btc_price, 'rsi': btc_rsi, 'decision': btc_decision},
+        'PAXG': {'price': paxg_price, 'rsi': paxg_rsi, 'decision': paxg_decision}
+    }
+    save_state(new_state)
+    
     print(f"BTC: ${btc_price:,.0f} | RSI: {btc_rsi:.1f} | {btc_decision}")
     print(f"PAXG: ${paxg_price:,.0f} | RSI: {paxg_rsi:.1f} | {paxg_decision}")
 
