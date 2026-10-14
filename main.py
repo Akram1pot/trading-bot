@@ -26,21 +26,45 @@ class TelegramBot:
 
 # ============= CoinGecko API =============
 def get_coin_data(coin_id):
+    """جلب بيانات السوق الحالية"""
     url = f"https://api.coingecko.com/api/v3/coins/{coin_id}"
     params = {"localization": "false", "tickers": "false", "community_data": "false", "developer_data": "false"}
     response = requests.get(url, params=params, timeout=30)
     response.raise_for_status()
     return response.json()
 
-def calculate_rsi(coin_id, days=14):
+def get_price_history(coin_id, days=30):
+    """جلب تاريخ الأسعار لحساب المؤشرات الفنية"""
     url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
     params = {"vs_currency": "usd", "days": days}
     response = requests.get(url, params=params, timeout=30)
     response.raise_for_status()
     data = response.json()
-    prices = [p[1] for p in data['prices']]
-    
-    if len(prices) < 15:
+    return [p[1] for p in data['prices']]
+
+# ============= Technical Indicators =============
+def calculate_ema(prices, period):
+    """حساب المتوسط المتحرك الأسي (EMA)"""
+    if len(prices) < period:
+        return None
+    multiplier = 2 / (period + 1)
+    ema = prices[0]
+    for price in prices[1:]:
+        ema = (price - ema) * multiplier + ema
+    return ema
+
+def calculate_macd(prices):
+    """حساب MACD = EMA12 - EMA26"""
+    if len(prices) < 26:
+        return None, None, None
+    ema_12 = calculate_ema(prices, 12)
+    ema_26 = calculate_ema(prices, 26)
+    macd = ema_12 - ema_26
+    return macd, ema_12, ema_26
+
+def calculate_rsi(prices, period=14):
+    """حساب مؤشر القوة النسبية (RSI)"""
+    if len(prices) < period + 1:
         return 50.0
     
     gains, losses = [], []
@@ -49,8 +73,8 @@ def calculate_rsi(coin_id, days=14):
         gains.append(max(0, change))
         losses.append(max(0, -change))
     
-    avg_gain = sum(gains[-14:]) / 14
-    avg_loss = sum(losses[-14:]) / 14
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
     
     if avg_loss == 0:
         return 100.0
@@ -58,31 +82,48 @@ def calculate_rsi(coin_id, days=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-def get_decision(rsi):
-    if rsi < 30:
-        return "BUY", "🟢", f"RSI منخفض ({rsi:.1f})", 0.80
+# ============= Smart Decision Logic =============
+def get_decision(rsi, macd, price, ema_9):
+    """
+    قرار ذكي بناءً على مؤشرات متعددة:
+    - RSI: التشبع الشرائي/البيعي
+    - MACD: زخم السوق
+    - EMA 9: الاتجاه قصير المدى
+    """
+    # إشارة شراء قوية: RSI منخفض + زخم إيجابي + السعر فوق EMA
+    if rsi < 30 and macd is not None and macd > 0 and price > ema_9:
+        return "BUY", "🟢", f"RSI منخفض ({rsi:.1f}) + MACD إيجابي + سعر فوق EMA", 0.85
+    
+    # إشارة بيع قوية: RSI مرتفع + زخم سلبي
+    elif rsi > 70 and macd is not None and macd < 0:
+        return "SELL", "🔴", f"RSI مرتفع ({rsi:.1f}) + MACD سلبي", 0.80
+    
+    # إشارة بيع متوسطة: RSI مرتفع فقط (انتظر تأكيد MACD)
     elif rsi > 70:
-        return "SELL", "", f"RSI مرتفع ({rsi:.1f})", 0.80
+        return "HOLD", "🟡", f"RSI مرتفع ({rsi:.1f}) لكن MACD لم يؤكد بعد", 0.60
+    
+    # إشارة شراء متوسطة: RSI منخفض فقط
+    elif rsi < 30:
+        return "HOLD", "🟡", f"RSI منخفض ({rsi:.1f}) لكن MACD لم يؤكد بعد", 0.60
+    
+    # منطقة محايدة
     else:
         return "HOLD", "🟡", "منطقة محايدة", 0.50
 
 # ============= State Management =============
 def load_state():
-    """تحميل آخر حالة محفوظة"""
     if os.path.isfile(STATE_FILE):
         with open(STATE_FILE, 'r', encoding='utf-8') as f:
             return json.load(f)
     return {}
 
 def save_state(state):
-    """حفظ الحالة الحالية"""
     with open(STATE_FILE, 'w', encoding='utf-8') as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
-def should_send_alert(coin, price, rsi, decision, last_state):
+def should_send_alert(coin, price, rsi, macd, decision, last_state):
     """تحديد ما إذا كان يجب إرسال تنبيه"""
     
-    # إذا لم توجد حالة سابقة، أرسل دائماً (أول تشغيل)
     if coin not in last_state:
         return True, "أول تشغيل"
     
@@ -91,7 +132,7 @@ def should_send_alert(coin, price, rsi, decision, last_state):
     last_decision = last['decision']
     last_rsi = last['rsi']
     
-    # الشرط 1: تغير القرار (HOLD → BUY/SELL أو العكس)
+    # الشرط 1: تغير القرار
     if decision != last_decision:
         return True, f"تغير القرار من {last_decision} إلى {decision}"
     
@@ -104,23 +145,33 @@ def should_send_alert(coin, price, rsi, decision, last_state):
     if price_change_pct > 3.0:
         return True, f"تغير السعر {price_change_pct:.2f}%"
     
-    # لا تنبيه
+    # الشرط 4: تغير MACD من سلبي إلى إيجابي (إشارة شراء)
+    last_macd = last.get('macd')
+    if last_macd is not None and macd is not None:
+        if last_macd < 0 and macd > 0:
+            return True, f"MACD تحول إيجابي ({macd:.2f})"
+        elif last_macd > 0 and macd < 0:
+            return True, f"MACD تحول سلبي ({macd:.2f})"
+    
     return False, None
 
 # ============= Logging =============
-def log_decision(coin, price, rsi, decision, reason, confidence):
+def log_decision(coin, price, rsi, macd, ema_9, ema_21, decision, reason, confidence):
     file_exists = os.path.isfile(LOG_FILE)
     
     with open(LOG_FILE, 'a', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         if not file_exists:
-            writer.writerow(['timestamp', 'coin', 'price', 'rsi', 'decision', 'reason', 'confidence'])
+            writer.writerow(['timestamp', 'coin', 'price', 'rsi', 'macd', 'ema_9', 'ema_21', 'decision', 'reason', 'confidence'])
         
         writer.writerow([
             datetime.now().strftime('%Y-%m-%d %H:%M UTC'),
             coin,
             f"${price:,.2f}",
             f"{rsi:.2f}",
+            f"{macd:.2f}" if macd is not None else "N/A",
+            f"${ema_9:,.2f}" if ema_9 is not None else "N/A",
+            f"${ema_21:,.2f}" if ema_21 is not None else "N/A",
             decision,
             reason,
             f"{confidence*100:.0f}%"
@@ -132,61 +183,81 @@ def log_decision(coin, price, rsi, decision, reason, confidence):
 def analyze():
     print("Fetching BTC and PAXG data...")
     
-    # تحميل آخر حالة
     last_state = load_state()
+    alerts = []
     
-    # البيتكوين
-    btc_data = get_coin_data('bitcoin')
-    btc_price = btc_data['market_data']['current_price']['usd']
-    btc_rsi = calculate_rsi('bitcoin', 14)
-    btc_decision, btc_emoji, btc_reason, btc_conf = get_decision(btc_rsi)
-    
-    # الذهب (PAXG)
-    paxg_data = get_coin_data('pax-gold')
-    paxg_price = paxg_data['market_data']['current_price']['usd']
-    paxg_rsi = calculate_rsi('pax-gold', 14)
-    paxg_decision, paxg_emoji, paxg_reason, paxg_conf = get_decision(paxg_rsi)
-    
-    # تسجيل القرارات في CSV (دائماً)
-    log_decision('BTC', btc_price, btc_rsi, btc_decision, btc_reason, btc_conf)
-    log_decision('PAXG', paxg_price, paxg_rsi, paxg_decision, paxg_reason, paxg_conf)
-    
-    # التحقق من التنبيهات الذكية
-    btc_alert, btc_alert_reason = should_send_alert('BTC', btc_price, btc_rsi, btc_decision, last_state)
-    paxg_alert, paxg_alert_reason = should_send_alert('PAXG', paxg_price, paxg_rsi, paxg_decision, last_state)
-    
-    tg = TelegramBot(TELEGRAM_TOKEN, CHAT_ID)
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M UTC')
-    
-    # إرسال فقط إذا كان هناك تنبيه
-    if btc_alert or paxg_alert:
-        alert_lines = []
+    for coin_id, coin_name in [('bitcoin', 'BTC'), ('pax-gold', 'PAXG')]:
+        print(f"\n--- {coin_name} ---")
         
-        if btc_alert:
-            alert_lines.append(f"🚨 <b>BTC ALERT:</b> {btc_alert_reason}")
-            alert_lines.append(f"{btc_emoji} <b>BTC:</b> ${btc_price:,.0f} | RSI: {btc_rsi:.1f} | {btc_decision}")
+        # جلب البيانات
+        coin_data = get_coin_data(coin_id)
+        price = coin_data['market_data']['current_price']['usd']
+        price_history = get_price_history(coin_id, days=30)
         
-        if paxg_alert:
-            alert_lines.append(f"🚨 <b>GOLD ALERT:</b> {paxg_alert_reason}")
-            alert_lines.append(f"{paxg_emoji} <b>GOLD:</b> ${paxg_price:,.0f} | RSI: {paxg_rsi:.1f} | {paxg_decision}")
+        # حساب المؤشرات الفنية
+        rsi = calculate_rsi(price_history, 14)
+        macd, ema_12, ema_26 = calculate_macd(price_history)
+        ema_9 = calculate_ema(price_history[-20:], 9) if len(price_history) >= 20 else None
+        ema_21 = calculate_ema(price_history[-30:], 21) if len(price_history) >= 30 else None
         
-        alert_lines.append(f" {timestamp}")
+        # اتخاذ القرار
+        decision, emoji, reason, confidence = get_decision(rsi, macd, price, ema_9)
         
-        msg = "\n".join(alert_lines)
+        # تسجيل القرار
+        log_decision(coin_name, price, rsi, macd, ema_9, ema_21, decision, reason, confidence)
+        
+        # التحقق من التنبيهات
+        should_alert, alert_reason = should_send_alert(coin_name, price, rsi, macd, decision, last_state)
+        
+        if should_alert:
+            alerts.append({
+                'name': coin_name,
+                'emoji': emoji,
+                'price': price,
+                'rsi': rsi,
+                'macd': macd,
+                'ema_9': ema_9,
+                'decision': decision,
+                'reason': reason,
+                'alert_reason': alert_reason
+            })
+        
+        # حفظ الحالة
+        last_state[coin_name] = {
+            'price': price,
+            'rsi': rsi,
+            'macd': macd,
+            'decision': decision
+        }
+        
+        print(f"{coin_name}: ${price:,.0f} | RSI: {rsi:.1f} | MACD: {macd:.2f if macd else 'N/A'} | {decision}")
+    
+    # إرسال التنبيهات
+    if alerts:
+        tg = TelegramBot(TELEGRAM_TOKEN, CHAT_ID)
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M UTC')
+        
+        msg_lines = [f"🚨 <b>Smart Alert</b>\n{'━' * 20}"]
+        
+        for alert in alerts:
+            msg_lines.append(f"\n{alert['emoji']} <b>{alert['name']}:</b> ${alert['price']:,.0f}")
+            msg_lines.append(f"📊 RSI: {alert['rsi']:.1f} | MACD: {alert['macd']:.2f}" if alert['macd'] else f"📊 RSI: {alert['rsi']:.1f}")
+            if alert['ema_9']:
+                msg_lines.append(f"📈 EMA 9: ${alert['ema_9']:,.0f}")
+            msg_lines.append(f"{alert['emoji']} Decision: {alert['decision']}")
+            msg_lines.append(f"📝 Reason: {alert['reason']}")
+            msg_lines.append(f"🎯 Confidence: {alert['confidence']*100:.0f}%")
+            msg_lines.append(f"⚡ Alert: {alert['alert_reason']}")
+        
+        msg_lines.append(f"\n⏰ {timestamp}")
+        
+        msg = "\n".join(msg_lines)
         success = tg.send(msg)
-        print(f"🚨 Alert sent: {success}")
+        print(f"\n🚨 Alert sent: {success}")
     else:
-        print("💤 No alert needed - market stable")
+        print("\n💤 No alert needed - market stable")
     
-    # حفظ الحالة الجديدة
-    new_state = {
-        'BTC': {'price': btc_price, 'rsi': btc_rsi, 'decision': btc_decision},
-        'PAXG': {'price': paxg_price, 'rsi': paxg_rsi, 'decision': paxg_decision}
-    }
-    save_state(new_state)
-    
-    print(f"BTC: ${btc_price:,.0f} | RSI: {btc_rsi:.1f} | {btc_decision}")
-    print(f"PAXG: ${paxg_price:,.0f} | RSI: {paxg_rsi:.1f} | {paxg_decision}")
+    save_state(last_state)
 
 if __name__ == "__main__":
     analyze()
