@@ -12,17 +12,17 @@ class TelegramBot:
         self.url = f"https://api.telegram.org/bot{token}/sendMessage"
         self.chat_id = chat_id
     
-    def send(self, text, parse_mode="HTML"):
+    def send(self, text):
         try:
-            requests.post(self.url, json={"chat_id": self.chat_id, "text": text, "parse_mode": parse_mode}, timeout=10)
+            requests.post(self.url, json={"chat_id": self.chat_id, "text": text, "parse_mode": "HTML"}, timeout=10)
             return True
         except Exception as e:
             print(f"Telegram error: {e}")
             return False
 
 # ============= CoinGecko API =============
-def get_btc_data():
-    url = "https://api.coingecko.com/api/v3/coins/bitcoin"
+def get_coin_data(coin_id):
+    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}"
     params = {"localization": "false", "tickers": "false", "community_data": "false", "developer_data": "false"}
     response = requests.get(url, params=params, timeout=30)
     response.raise_for_status()
@@ -54,55 +54,44 @@ def calculate_rsi(coin_id, days=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-# ============= Smart Notification Logic =============
-def analyze():
-    print("Fetching BTC data from CoinGecko...")
-    data = get_btc_data()
-    
-    price = data['market_data']['current_price']['usd']
-    change_24h = data['market_data']['price_change_percentage_24h']
-    high_24h = data['market_data']['high_24h']['usd']
-    low_24h = data['market_data']['low_24h']['usd']
-    market_cap = data['market_data']['market_cap']['usd']
-    
-    rsi = calculate_rsi('bitcoin', 14)
-    
-    # Determine decision
+def get_decision(rsi):
     if rsi < 30:
-        decision, emoji, reason, confidence = "BUY", "🟢", f"RSI منخفض ({rsi:.1f}) - تشبع بيعي", 0.80
+        return "BUY", "🟢", f"RSI منخفض ({rsi:.1f})", 0.80
     elif rsi > 70:
-        decision, emoji, reason, confidence = "SELL", "", f"RSI مرتفع ({rsi:.1f}) - تشبع شرائي", 0.80
+        return "SELL", "🔴", f"RSI مرتفع ({rsi:.1f})", 0.80
     else:
-        decision, emoji, reason, confidence = "HOLD", "", "منطقة محايدة", 0.50
+        return "HOLD", "🟡", "منطقة محايدة", 0.50
+
+# ============= Main Analysis =============
+def analyze():
+    print("Fetching BTC and PAXG data...")
+    
+    # جلب بيانات البيتكوين
+    btc_data = get_coin_data('bitcoin')
+    btc_price = btc_data['market_data']['current_price']['usd']
+    btc_rsi = calculate_rsi('bitcoin', 14)
+    btc_decision, btc_emoji, btc_reason, btc_conf = get_decision(btc_rsi)
+    
+    # جلب بيانات الذهب (PAXG)
+    paxg_data = get_coin_data('pax-gold')
+    paxg_price = paxg_data['market_data']['current_price']['usd']
+    paxg_rsi = calculate_rsi('pax-gold', 14)
+    paxg_decision, paxg_emoji, paxg_reason, paxg_conf = get_decision(paxg_rsi)
     
     tg = TelegramBot(TELEGRAM_TOKEN, CHAT_ID)
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M UTC')
     
-    # Smart notification: Short for HOLD, detailed for BUY/SELL
-    if decision == "HOLD":
-        # رسالة قصيرة لـ HOLD
-        msg = f"{emoji} <b>BTC:</b> ${price:,.0f} | RSI: {rsi:.1f} | HOLD\n⏰ {timestamp}"
-    else:
-        # رسالة مفصلة لـ BUY/SELL
-        msg = f"""
-{emoji} <b>BTC/USDT - {decision} SIGNAL</b>
-━━━━━━━━━━━━━━━━━━━━
-💰 <b>Price:</b> ${price:,.2f}
-📈 <b>24h Change:</b> {change_24h:+.2f}%
-🔺 <b>24h High:</b> ${high_24h:,.2f}
-🔻 <b>24h Low:</b> ${low_24h:,.2f}
-💎 <b>Market Cap:</b> ${market_cap/1e9:.1f}B
-━━━━━━━━━━━━━━━━━━━━
-📊 <b>RSI (14-day):</b> {rsi:.2f}
-{emoji} <b>Decision:</b> {decision}
- <b>Reason:</b> {reason}
-🎯 <b>Confidence:</b> {confidence*100:.0f}%
- {timestamp}
+    # رسالة موحدة للبيتكوين والذهب
+    msg = f"""
+{btc_emoji} <b>BTC:</b> ${btc_price:,.0f} | RSI: {btc_rsi:.1f} | {btc_decision}
+{paxg_emoji} <b>GOLD:</b> ${paxg_price:,.0f} | RSI: {paxg_rsi:.1f} | {paxg_decision}
+⏰ {timestamp}
 """
     
     success = tg.send(msg)
-    print(f"✅ Sent {decision} signal" if success else "❌ Failed")
-    print(f"Price: ${price:,.2f} | RSI: {rsi:.2f}")
+    print(f"✅ Sent" if success else "❌ Failed")
+    print(f"BTC: ${btc_price:,.0f} | RSI: {btc_rsi:.1f} | {btc_decision}")
+    print(f"PAXG: ${paxg_price:,.0f} | RSI: {paxg_rsi:.1f} | {paxg_decision}")
 
 if __name__ == "__main__":
     analyze()
