@@ -1,10 +1,12 @@
 import requests
 import os
+import csv
 from datetime import datetime
 
 # ============= Configuration =============
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = "362387912"
+LOG_FILE = "trading_log.csv"
 
 # ============= Telegram Bot =============
 class TelegramBot:
@@ -62,26 +64,52 @@ def get_decision(rsi):
     else:
         return "HOLD", "🟡", "منطقة محايدة", 0.50
 
+# ============= Logging =============
+def log_decision(coin, price, rsi, decision, reason, confidence):
+    """تسجيل القرار في ملف CSV"""
+    file_exists = os.path.isfile(LOG_FILE)
+    
+    with open(LOG_FILE, 'a', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(['timestamp', 'coin', 'price', 'rsi', 'decision', 'reason', 'confidence'])
+        
+        writer.writerow([
+            datetime.now().strftime('%Y-%m-%d %H:%M UTC'),
+            coin,
+            f"${price:,.2f}",
+            f"{rsi:.2f}",
+            decision,
+            reason,
+            f"{confidence*100:.0f}%"
+        ])
+    
+    print(f"📝 Logged: {coin} {decision} at ${price:,.0f}")
+
 # ============= Main Analysis =============
 def analyze():
     print("Fetching BTC and PAXG data...")
     
-    # جلب بيانات البيتكوين
+    # البيتكوين
     btc_data = get_coin_data('bitcoin')
     btc_price = btc_data['market_data']['current_price']['usd']
     btc_rsi = calculate_rsi('bitcoin', 14)
     btc_decision, btc_emoji, btc_reason, btc_conf = get_decision(btc_rsi)
     
-    # جلب بيانات الذهب (PAXG)
+    # الذهب (PAXG)
     paxg_data = get_coin_data('pax-gold')
     paxg_price = paxg_data['market_data']['current_price']['usd']
     paxg_rsi = calculate_rsi('pax-gold', 14)
     paxg_decision, paxg_emoji, paxg_reason, paxg_conf = get_decision(paxg_rsi)
     
+    # تسجيل القرارات في CSV
+    log_decision('BTC', btc_price, btc_rsi, btc_decision, btc_reason, btc_conf)
+    log_decision('PAXG', paxg_price, paxg_rsi, paxg_decision, paxg_reason, paxg_conf)
+    
+    # إرسال إلى Telegram
     tg = TelegramBot(TELEGRAM_TOKEN, CHAT_ID)
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M UTC')
     
-    # رسالة موحدة للبيتكوين والذهب
     msg = f"""
 {btc_emoji} <b>BTC:</b> ${btc_price:,.0f} | RSI: {btc_rsi:.1f} | {btc_decision}
 {paxg_emoji} <b>GOLD:</b> ${paxg_price:,.0f} | RSI: {paxg_rsi:.1f} | {paxg_decision}
