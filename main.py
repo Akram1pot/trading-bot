@@ -1,12 +1,17 @@
 import requests
 import os
 import csv
+import json
 from datetime import datetime
 
 # ============= Configuration =============
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = "362387912"
 LOG_FILE = "trading_log.csv"
+PORTFOLIO_FILE = "portfolio.json"
+
+VIRTUAL_CASH = 1000.0  # رأس المال التجريبي الابتدائي
+TRADE_SIZE_USD = 100.0 # حجم كل صفقة تجريبية
 
 # ============= Telegram Bot =============
 class TelegramBot:
@@ -21,6 +26,58 @@ class TelegramBot:
         except Exception as e:
             print(f"Telegram error: {e}")
             return False
+
+# ============= Portfolio Management (Paper Trading) =============
+def load_portfolio():
+    if os.path.isfile(PORTFOLIO_FILE):
+        with open(PORTFOLIO_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {
+        'cash': VIRTUAL_CASH,
+        'holdings': {'BTC': 0.0, 'PAXG': 0.0},
+        'total_trades': 0,
+        'start_date': datetime.now().strftime('%Y-%m-%d')
+    }
+
+def save_portfolio(portfolio):
+    with open(PORTFOLIO_FILE, 'w', encoding='utf-8') as f:
+        json.dump(portfolio, f, ensure_ascii=False, indent=2)
+
+def execute_paper_trade(coin_name, decision, price, portfolio):
+    """تنفيذ صفقة تجريبية وتحديث المحفظة"""
+    trade_action = "لا يوجد تداول"
+    
+    if decision == "BUY" and portfolio['cash'] >= TRADE_SIZE_USD:
+        qty = TRADE_SIZE_USD / price
+        portfolio['holdings'][coin_name] = portfolio['holdings'].get(coin_name, 0.0) + qty
+        portfolio['cash'] -= TRADE_SIZE_USD
+        portfolio['total_trades'] += 1
+        trade_action = f"شراء {qty:.6f} @ ${price:,.0f}"
+        
+    elif decision == "SELL" and portfolio['holdings'].get(coin_name, 0.0) > 0:
+        qty = portfolio['holdings'][coin_name]
+        sell_value = qty * price
+        portfolio['cash'] += sell_value
+        portfolio['holdings'][coin_name] = 0.0
+        portfolio['total_trades'] += 1
+        trade_action = f"بيع {qty:.6f} @ ${price:,.0f} (قيمة: ${sell_value:,.0f})"
+        
+    return trade_action
+
+def calculate_portfolio_value(portfolio, current_prices):
+    """حساب القيمة الحالية للمحفظة والربح/الخسارة"""
+    current_value = portfolio['cash']
+    holdings_value = 0.0
+    
+    for coin, qty in portfolio['holdings'].items():
+        if qty > 0 and coin in current_prices:
+            holdings_value += qty * current_prices[coin]
+            
+    total_value = current_value + holdings_value
+    total_pnl = total_value - VIRTUAL_CASH
+    pnl_pct = (total_pnl / VIRTUAL_CASH) * 100
+    
+    return total_value, total_pnl, pnl_pct
 
 # ============= CoinGecko API =============
 def get_coin_data(coin_id):
@@ -59,19 +116,15 @@ def calculate_macd(prices):
 def calculate_rsi(prices, period=14):
     if len(prices) < period + 1:
         return 50.0
-    
     gains, losses = [], []
     for i in range(1, len(prices)):
         change = prices[i] - prices[i-1]
         gains.append(max(0, change))
         losses.append(max(0, -change))
-    
     avg_gain = sum(gains[-period:]) / period
     avg_loss = sum(losses[-period:]) / period
-    
     if avg_loss == 0:
         return 100.0
-    
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
@@ -88,45 +141,30 @@ def get_decision(rsi, macd, price, ema_9, last_rsi=None):
     else:
         return "HOLD", "🟡", "منطقة محايدة", 0.50
 
-# ============= State Management (محسّن) =============
+# ============= State Management =============
 def get_last_state_from_csv(coin_name):
-    """قراءة آخر حالة من CSV - يتعامل مع جميع الحالات"""
     if not os.path.isfile(LOG_FILE):
-        print(f"📝 CSV file not found: {LOG_FILE}")
         return None
-    
     try:
         with open(LOG_FILE, 'r', encoding='utf-8') as f:
             content = f.read().strip()
             if not content:
-                print(f" CSV file is empty: {LOG_FILE}")
                 return None
-            
             f.seek(0)
             reader = csv.DictReader(f)
-            
-            # التحقق من وجود عمود 'coin'
             if reader.fieldnames is None or 'coin' not in reader.fieldnames:
-                print(f" CSV file has no 'coin' column. Headers: {reader.fieldnames}")
                 return None
-            
             last_row = None
             for row in reader:
                 if row.get('coin') == coin_name:
                     last_row = row
-            
             if last_row is None:
-                print(f"📝 No data found for {coin_name} in CSV")
                 return None
-            
-            # استخراج البيانات
             state = {
                 'price': float(last_row['price'].replace('$', '').replace(',', '')),
                 'rsi': float(last_row['rsi']),
                 'decision': last_row['decision'],
             }
-            
-            # MACD (قد لا يكون موجوداً)
             if 'macd' in last_row and last_row['macd'] != 'N/A':
                 try:
                     state['macd'] = float(last_row['macd'])
@@ -134,54 +172,38 @@ def get_last_state_from_csv(coin_name):
                     state['macd'] = None
             else:
                 state['macd'] = None
-            
             return state
-            
     except Exception as e:
         print(f"⚠️ Error reading CSV: {e}")
         return None
 
 def should_send_alert(coin, price, rsi, macd, decision, last_state):
-    """تنبيهات ذكية"""
-    
     if last_state is None:
         return True, "أول تشغيل"
-    
     last_price = last_state['price']
     last_decision = last_state['decision']
-    
-    # الشرط 1: تغير القرار
     if decision != last_decision:
         return True, f"تغير القرار من {last_decision} إلى {decision}"
-    
-    # الشرط 2: RSI في منطقة حرجة
     if rsi < 25 or rsi > 75:
         return True, f"RSI حرج جداً ({rsi:.1f})"
-    
-    # الشرط 3: تغير السعر أكثر من 3%
     price_change_pct = abs(price - last_price) / last_price * 100
     if price_change_pct > 3.0:
         return True, f"تغير السعر {price_change_pct:.2f}%"
-    
-    # الشرط 4: تحول MACD
     last_macd = last_state.get('macd')
     if last_macd is not None and macd is not None:
         if last_macd < 0 and macd > 0:
             return True, "MACD تحول إيجابي"
         elif last_macd > 0 and macd < 0:
             return True, "MACD تحول سلبي"
-    
     return False, None
 
 # ============= Logging =============
-def log_decision(coin, price, rsi, macd, ema_9, ema_21, decision, reason, confidence):
+def log_decision(coin, price, rsi, macd, ema_9, ema_21, decision, reason, confidence, trade_action):
     file_exists = os.path.isfile(LOG_FILE) and os.path.getsize(LOG_FILE) > 0
-    
     with open(LOG_FILE, 'a', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         if not file_exists:
-            writer.writerow(['timestamp', 'coin', 'price', 'rsi', 'macd', 'ema_9', 'ema_21', 'decision', 'reason', 'confidence'])
-        
+            writer.writerow(['timestamp', 'coin', 'price', 'rsi', 'macd', 'ema_9', 'ema_21', 'decision', 'reason', 'confidence', 'trade_action'])
         writer.writerow([
             datetime.now().strftime('%Y-%m-%d %H:%M UTC'),
             coin,
@@ -192,40 +214,42 @@ def log_decision(coin, price, rsi, macd, ema_9, ema_21, decision, reason, confid
             f"${ema_21:,.2f}" if ema_21 is not None else "N/A",
             decision,
             reason,
-            f"{confidence*100:.0f}%"
+            f"{confidence*100:.0f}%",
+            trade_action
         ])
 
 # ============= Main Analysis =============
 def analyze():
-    print("Fetching BTC and PAXG data...")
+    print("Fetching data and running Paper Trading...")
     
+    portfolio = load_portfolio()
     alerts = []
+    current_prices = {}
     
     for coin_id, coin_name in [('bitcoin', 'BTC'), ('pax-gold', 'PAXG')]:
         print(f"\n--- {coin_name} ---")
         
-        # جلب البيانات
         coin_data = get_coin_data(coin_id)
         price = coin_data['market_data']['current_price']['usd']
-        price_history = get_price_history(coin_id, days=30)
+        current_prices[coin_name] = price
         
-        # حساب المؤشرات
+        price_history = get_price_history(coin_id, days=30)
         rsi = calculate_rsi(price_history, 14)
         macd, ema_12, ema_26 = calculate_macd(price_history)
         ema_9 = calculate_ema(price_history[-20:], 9) if len(price_history) >= 20 else None
         ema_21 = calculate_ema(price_history[-30:], 21) if len(price_history) >= 30 else None
         
-        # الحصول على آخر حالة
         last_state = get_last_state_from_csv(coin_name)
         last_rsi = last_state['rsi'] if last_state else None
         
-        # اتخاذ القرار
         decision, emoji, reason, confidence = get_decision(rsi, macd, price, ema_9, last_rsi)
         
-        # تسجيل القرار
-        log_decision(coin_name, price, rsi, macd, ema_9, ema_21, decision, reason, confidence)
+        # تنفيذ التداول التجريبي
+        trade_action = execute_paper_trade(coin_name, decision, price, portfolio)
         
-        # التحقق من التنبيهات
+        # تسجيل القرار مع نتيجة التداول
+        log_decision(coin_name, price, rsi, macd, ema_9, ema_21, decision, reason, confidence, trade_action)
+        
         should_alert, alert_reason = should_send_alert(coin_name, price, rsi, macd, decision, last_state)
         
         if should_alert:
@@ -239,18 +263,25 @@ def analyze():
                 'decision': decision,
                 'reason': reason,
                 'confidence': confidence,
-                'alert_reason': alert_reason
+                'alert_reason': alert_reason,
+                'trade_action': trade_action
             })
         
         macd_str = f"{macd:.2f}" if macd is not None else "N/A"
-        print(f"{coin_name}: ${price:,.0f} | RSI: {rsi:.1f} | MACD: {macd_str} | {decision}")
+        print(f"{coin_name}: ${price:,.0f} | RSI: {rsi:.1f} | MACD: {macd_str} | {decision} | {trade_action}")
+    
+    # حفظ المحفظة المحدثة
+    save_portfolio(portfolio)
+    
+    # حساب أداء المحفظة
+    total_value, total_pnl, pnl_pct = calculate_portfolio_value(portfolio, current_prices)
     
     # إرسال التنبيهات
     if alerts:
         tg = TelegramBot(TELEGRAM_TOKEN, CHAT_ID)
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M UTC')
         
-        msg_lines = [f" <b>Smart Alert</b>\n{'━' * 20}"]
+        msg_lines = [f" <b>Smart Alert & Paper Trade</b>\n{'━' * 25}"]
         
         for alert in alerts:
             msg_lines.append(f"\n{alert['emoji']} <b>{alert['name']}:</b> ${alert['price']:,.0f}")
@@ -260,10 +291,16 @@ def analyze():
                 msg_lines.append(f"📈 EMA 9: ${alert['ema_9']:,.0f}")
             msg_lines.append(f"{alert['emoji']} Decision: {alert['decision']}")
             msg_lines.append(f"📝 Reason: {alert['reason']}")
-            msg_lines.append(f"🎯 Confidence: {alert['confidence']*100:.0f}%")
+            msg_lines.append(f"💼 Trade: {alert['trade_action']}")
             msg_lines.append(f"⚡ Alert: {alert['alert_reason']}")
         
-        msg_lines.append(f"\n⏰ {timestamp}")
+        # إضافة ملخص المحفظة في نهاية الرسالة
+        pnl_emoji = "🟢" if total_pnl >= 0 else "🔴"
+        msg_lines.append(f"\n{'━' * 25}")
+        msg_lines.append(f"💰 <b>Portfolio Value:</b> ${total_value:,.2f}")
+        msg_lines.append(f"📈 <b>Total PnL:</b> {pnl_emoji} ${total_pnl:+,.2f} ({pnl_pct:+.2f}%)")
+        msg_lines.append(f"🔄 <b>Total Trades:</b> {portfolio['total_trades']}")
+        msg_lines.append(f"⏰ {timestamp}")
         
         msg = "\n".join(msg_lines)
         success = tg.send(msg)
