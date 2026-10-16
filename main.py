@@ -75,64 +75,80 @@ def calculate_rsi(prices, period=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-# ============= Smart Decision Logic (محسّن) =============
+# ============= Smart Decision Logic =============
 def get_decision(rsi, macd, price, ema_9, last_rsi=None):
-    """
-    منطق قرار محسّن:
-    - BUY عند RSI < 25 (تشبع بيعي شديد) أو RSI < 30 + MACD يتحسن
-    - SELL عند RSI > 75 (تشبع شرائي شديد) أو RSI > 70 + MACD يضعف
-    """
-    # BUY قوي: RSI منخفض جداً (تشبع بيعي شديد)
     if rsi < 25:
         return "BUY", "🟢", f"RSI منخفض جداً ({rsi:.1f}) - تشبع بيعي شديد", 0.85
-    
-    # BUY متوسط: RSI < 30 + MACD يتحسن (أقل سلبية)
     elif rsi < 30 and last_rsi is not None and rsi > last_rsi:
         return "BUY", "🟢", f"RSI منخفض ({rsi:.1f}) + يتحسن من {last_rsi:.1f}", 0.75
-    
-    # SELL قوي: RSI مرتفع جداً (تشبع شرائي شديد)
     elif rsi > 75:
         return "SELL", "🔴", f"RSI مرتفع جداً ({rsi:.1f}) - تشبع شرائي شديد", 0.85
-    
-    # SELL متوسط: RSI > 70 + MACD سلبي
     elif rsi > 70 and macd is not None and macd < 0:
-        return "SELL", "", f"RSI مرتفع ({rsi:.1f}) + MACD سلبي", 0.75
-    
-    # منطقة محايدة
+        return "SELL", "🔴", f"RSI مرتفع ({rsi:.1f}) + MACD سلبي", 0.75
     else:
-        return "HOLD", "", "منطقة محايدة", 0.50
+        return "HOLD", "🟡", "منطقة محايدة", 0.50
 
-# ============= State Management (من CSV) =============
+# ============= State Management (محسّن) =============
 def get_last_state_from_csv(coin_name):
-    """قراءة آخر حالة من CSV بدلاً من JSON"""
+    """قراءة آخر حالة من CSV - يتعامل مع جميع الحالات"""
     if not os.path.isfile(LOG_FILE):
+        print(f"📝 CSV file not found: {LOG_FILE}")
         return None
     
-    with open(LOG_FILE, 'r', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        last_row = None
-        for row in reader:
-            if row['coin'] == coin_name:
-                last_row = row
-        
-        if last_row:
-            return {
+    try:
+        with open(LOG_FILE, 'r', encoding='utf-8') as f:
+            content = f.read().strip()
+            if not content:
+                print(f" CSV file is empty: {LOG_FILE}")
+                return None
+            
+            f.seek(0)
+            reader = csv.DictReader(f)
+            
+            # التحقق من وجود عمود 'coin'
+            if reader.fieldnames is None or 'coin' not in reader.fieldnames:
+                print(f" CSV file has no 'coin' column. Headers: {reader.fieldnames}")
+                return None
+            
+            last_row = None
+            for row in reader:
+                if row.get('coin') == coin_name:
+                    last_row = row
+            
+            if last_row is None:
+                print(f"📝 No data found for {coin_name} in CSV")
+                return None
+            
+            # استخراج البيانات
+            state = {
                 'price': float(last_row['price'].replace('$', '').replace(',', '')),
                 'rsi': float(last_row['rsi']),
                 'decision': last_row['decision'],
-                'macd': float(last_row['macd']) if last_row['macd'] != 'N/A' else None
             }
-    return None
+            
+            # MACD (قد لا يكون موجوداً)
+            if 'macd' in last_row and last_row['macd'] != 'N/A':
+                try:
+                    state['macd'] = float(last_row['macd'])
+                except (ValueError, TypeError):
+                    state['macd'] = None
+            else:
+                state['macd'] = None
+            
+            return state
+            
+    except Exception as e:
+        print(f"⚠️ Error reading CSV: {e}")
+        return None
 
 def should_send_alert(coin, price, rsi, macd, decision, last_state):
-    """تنبيهات ذكية حقيقية"""
+    """تنبيهات ذكية"""
     
     if last_state is None:
         return True, "أول تشغيل"
     
     last_price = last_state['price']
     last_decision = last_state['decision']
-    last_rsi = last_state['rsi']
     
     # الشرط 1: تغير القرار
     if decision != last_decision:
@@ -151,15 +167,15 @@ def should_send_alert(coin, price, rsi, macd, decision, last_state):
     last_macd = last_state.get('macd')
     if last_macd is not None and macd is not None:
         if last_macd < 0 and macd > 0:
-            return True, f"MACD تحول إيجابي"
+            return True, "MACD تحول إيجابي"
         elif last_macd > 0 and macd < 0:
-            return True, f"MACD تحول سلبي"
+            return True, "MACD تحول سلبي"
     
     return False, None
 
 # ============= Logging =============
 def log_decision(coin, price, rsi, macd, ema_9, ema_21, decision, reason, confidence):
-    file_exists = os.path.isfile(LOG_FILE)
+    file_exists = os.path.isfile(LOG_FILE) and os.path.getsize(LOG_FILE) > 0
     
     with open(LOG_FILE, 'a', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
@@ -199,11 +215,11 @@ def analyze():
         ema_9 = calculate_ema(price_history[-20:], 9) if len(price_history) >= 20 else None
         ema_21 = calculate_ema(price_history[-30:], 21) if len(price_history) >= 30 else None
         
-        # الحصول على آخر حالة من CSV
+        # الحصول على آخر حالة
         last_state = get_last_state_from_csv(coin_name)
         last_rsi = last_state['rsi'] if last_state else None
         
-        # اتخاذ القرار (مع last_rsi للتحسن)
+        # اتخاذ القرار
         decision, emoji, reason, confidence = get_decision(rsi, macd, price, ema_9, last_rsi)
         
         # تسجيل القرار
@@ -244,8 +260,8 @@ def analyze():
                 msg_lines.append(f"📈 EMA 9: ${alert['ema_9']:,.0f}")
             msg_lines.append(f"{alert['emoji']} Decision: {alert['decision']}")
             msg_lines.append(f"📝 Reason: {alert['reason']}")
-            msg_lines.append(f" Confidence: {alert['confidence']*100:.0f}%")
-            msg_lines.append(f" Alert: {alert['alert_reason']}")
+            msg_lines.append(f"🎯 Confidence: {alert['confidence']*100:.0f}%")
+            msg_lines.append(f"⚡ Alert: {alert['alert_reason']}")
         
         msg_lines.append(f"\n⏰ {timestamp}")
         
@@ -253,7 +269,7 @@ def analyze():
         success = tg.send(msg)
         print(f"\n🚨 Alert sent: {success}")
     else:
-        print("\n No alert needed - market stable")
+        print("\n💤 No alert needed - market stable")
 
 if __name__ == "__main__":
     analyze()
