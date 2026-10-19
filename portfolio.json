@@ -1,9 +1,9 @@
 {
-  "cash": 500.0,
+  "cash": 400.0,
   "holdings": {
     "BTC": 0.0,
-    "PAXG": 0.12074525817894984
+    "PAXG": 0.14486995390622498
   },
-  "total_trades": 5,
+  "total_trades": 6,
   "start_date": "2026-10-19"
 }
