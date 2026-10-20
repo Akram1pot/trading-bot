@@ -11,7 +11,7 @@ LOG_FILE = "trading_log.csv"
 PORTFOLIO_FILE = "portfolio.json"
 
 VIRTUAL_CASH = 1000.0
-TRADE_SIZE_USD = 100.0
+TRADE_SIZE_USD = 50.0  # تقليل من $100 إلى $50
 
 # ============= Telegram Bot =============
 class TelegramBot:
@@ -76,18 +76,37 @@ def calculate_rsi(prices, period=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-# ============= Smart Decision Logic =============
+# ============= Smart Decision Logic (محسّن) =============
 def get_decision(rsi, macd, price, ema_9, last_rsi=None):
-    if rsi < 25:
-        return "BUY", "🟢", f"RSI منخفض جداً ({rsi:.1f}) - تشبع بيعي شديد", 0.85
-    elif rsi < 30 and last_rsi is not None and rsi > last_rsi:
-        return "BUY", "🟢", f"RSI منخفض ({rsi:.1f}) + يتحسن من {last_rsi:.1f}", 0.75
+    """
+    منطق قرار محسّن - أكثر مرونة في الشراء:
+    - BUY قوي: RSI < 30 (بدلاً من 25)
+    - BUY متوسط: RSI < 35 + MACD < -50
+    - BUY خفيف: RSI < 40 + السعر تحت EMA 9
+    """
+    # BUY قوي: RSI منخفض جداً (تشبع بيعي)
+    if rsi < 30:
+        return "BUY", "🟢", f"RSI منخفض جداً ({rsi:.1f}) - تشبع بيعي", 0.85
+    
+    # BUY متوسط: RSI منخفض + MACD سلبي قوي
+    elif rsi < 35 and macd is not None and macd < -50:
+        return "BUY", "🟢", f"RSI منخفض ({rsi:.1f}) + MACD سلبي قوي ({macd:.1f})", 0.75
+    
+    # BUY خفيف: RSI معتدل + السعر تحت EMA
+    elif rsi < 40 and ema_9 is not None and price < ema_9:
+        return "BUY", "", f"RSI ({rsi:.1f}) + السعر تحت EMA 9", 0.65
+    
+    # SELL قوي: RSI مرتفع جداً
     elif rsi > 75:
         return "SELL", "🔴", f"RSI مرتفع جداً ({rsi:.1f}) - تشبع شرائي شديد", 0.85
+    
+    # SELL متوسط: RSI مرتفع + MACD سلبي
     elif rsi > 70 and macd is not None and macd < 0:
         return "SELL", "🔴", f"RSI مرتفع ({rsi:.1f}) + MACD سلبي", 0.75
+    
+    # منطقة محايدة
     else:
-        return "HOLD", "🟡", "منطقة محايدة", 0.50
+        return "HOLD", "", "منطقة محايدة", 0.50
 
 # ============= Paper Trading =============
 def load_portfolio():
@@ -136,7 +155,7 @@ def calculate_portfolio_value(portfolio, current_prices):
     pnl_pct = (total_pnl / VIRTUAL_CASH) * 100
     return total_value, total_pnl, pnl_pct
 
-# ============= State Management (من CSV) =============
+# ============= State Management =============
 def get_last_state_from_csv(coin_name):
     if not os.path.isfile(LOG_FILE):
         return None
@@ -179,8 +198,8 @@ def should_send_alert(coin, price, rsi, macd, decision, last_state):
     last_decision = last_state['decision']
     if decision != last_decision:
         return True, f"تغير القرار من {last_decision} إلى {decision}"
-    if rsi < 25 or rsi > 75:
-        return True, f"RSI حرج جداً ({rsi:.1f})"
+    if rsi < 30 or rsi > 75:
+        return True, f"RSI حرج ({rsi:.1f})"
     price_change_pct = abs(price - last_price) / last_price * 100
     if price_change_pct > 3.0:
         return True, f"تغير السعر {price_change_pct:.2f}%"
@@ -270,7 +289,7 @@ def analyze():
         tg = TelegramBot(TELEGRAM_TOKEN, CHAT_ID)
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M UTC')
         
-        msg_lines = [f" <b>Smart Alert & Paper Trade</b>\n{'━' * 25}"]
+        msg_lines = [f"🚨 <b>Smart Alert & Paper Trade</b>\n{'━' * 25}"]
         
         for alert in alerts:
             msg_lines.append(f"\n{alert['emoji']} <b>{alert['name']}:</b> ${alert['price']:,.0f}")
@@ -279,14 +298,14 @@ def analyze():
             if alert['ema_9']:
                 msg_lines.append(f"📈 EMA 9: ${alert['ema_9']:,.0f}")
             msg_lines.append(f"{alert['emoji']} Decision: {alert['decision']}")
-            msg_lines.append(f"📝 Reason: {alert['reason']}")
-            msg_lines.append(f" Confidence: {alert['confidence']*100:.0f}%")
+            msg_lines.append(f" Reason: {alert['reason']}")
+            msg_lines.append(f"🎯 Confidence: {alert['confidence']*100:.0f}%")
             msg_lines.append(f"💼 Trade: {alert['trade_action']}")
-            msg_lines.append(f"⚡ Alert: {alert['alert_reason']}")
+            msg_lines.append(f" Alert: {alert['alert_reason']}")
         
         pnl_emoji = "🟢" if total_pnl >= 0 else "🔴"
         msg_lines.append(f"\n{'━' * 25}")
-        msg_lines.append(f"💰 <b>Portfolio Value:</b> ${total_value:,.2f}")
+        msg_lines.append(f" <b>Portfolio Value:</b> ${total_value:,.2f}")
         msg_lines.append(f"📈 <b>Total PnL:</b> {pnl_emoji} ${total_pnl:+,.2f} ({pnl_pct:+.2f}%)")
         msg_lines.append(f"🔄 <b>Total Trades:</b> {portfolio['total_trades']}")
         msg_lines.append(f"⏰ {timestamp}")
@@ -295,7 +314,7 @@ def analyze():
         success = tg.send(msg)
         print(f"\n🚨 Alert sent: {success}")
     else:
-        print("\n💤 No alert needed - market stable")
+        print("\n No alert needed - market stable")
 
 if __name__ == "__main__":
     analyze()
