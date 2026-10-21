@@ -8,10 +8,11 @@ from datetime import datetime
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = "362387912"
 LOG_FILE = "trading_log.csv"
-PORTFOLIO_FILE = "portfolio.json"
+STATE_FILE = "last_state.json"
 
 VIRTUAL_CASH = 1000.0
-TRADE_SIZE_USD = 50.0  # تقليل من $100 إلى $50
+TRADE_SIZE_USD = 50.0
+MAX_PER_ASSET = 300.0  # حد أقصى 30% من المحفظة لكل أصل
 
 # ============= Telegram Bot =============
 class TelegramBot:
@@ -76,42 +77,42 @@ def calculate_rsi(prices, period=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-# ============= Smart Decision Logic (محسّن) =============
+# ============= Smart Decision Logic =============
 def get_decision(rsi, macd, price, ema_9, last_rsi=None):
-    """
-    منطق قرار محسّن - أكثر مرونة في الشراء:
-    - BUY قوي: RSI < 30 (بدلاً من 25)
-    - BUY متوسط: RSI < 35 + MACD < -50
-    - BUY خفيف: RSI < 40 + السعر تحت EMA 9
-    """
-    # BUY قوي: RSI منخفض جداً (تشبع بيعي)
+    # BUY قوي: RSI < 30 (تشبع بيعي)
     if rsi < 30:
-        return "BUY", "🟢", f"RSI منخفض جداً ({rsi:.1f}) - تشبع بيعي", 0.85
-    
-    # BUY متوسط: RSI منخفض + MACD سلبي قوي
+        return "BUY", "", f"RSI منخفض جداً ({rsi:.1f}) - تشبع بيعي", 0.85
+    # BUY متوسط: RSI < 35 + MACD سلبي قوي
     elif rsi < 35 and macd is not None and macd < -50:
-        return "BUY", "🟢", f"RSI منخفض ({rsi:.1f}) + MACD سلبي قوي ({macd:.1f})", 0.75
-    
-    # BUY خفيف: RSI معتدل + السعر تحت EMA
+        return "BUY", "🟢", f"RSI منخفض ({rsi:.1f}) + MACD سلبي قوي", 0.75
+    # BUY خفيف: RSI < 40 + السعر تحت EMA
     elif rsi < 40 and ema_9 is not None and price < ema_9:
-        return "BUY", "", f"RSI ({rsi:.1f}) + السعر تحت EMA 9", 0.65
-    
-    # SELL قوي: RSI مرتفع جداً
+        return "BUY", "🟡", f"RSI ({rsi:.1f}) + السعر تحت EMA 9", 0.65
+    # SELL قوي: RSI > 75
     elif rsi > 75:
-        return "SELL", "🔴", f"RSI مرتفع جداً ({rsi:.1f}) - تشبع شرائي شديد", 0.85
-    
-    # SELL متوسط: RSI مرتفع + MACD سلبي
+        return "SELL", "🔴", f"RSI مرتفع جداً ({rsi:.1f}) - تشبع شرائي", 0.85
+    # SELL متوسط: RSI > 70 + MACD سلبي
     elif rsi > 70 and macd is not None and macd < 0:
         return "SELL", "🔴", f"RSI مرتفع ({rsi:.1f}) + MACD سلبي", 0.75
-    
-    # منطقة محايدة
     else:
-        return "HOLD", "", "منطقة محايدة", 0.50
+        return "HOLD", "🟡", "منطقة محايدة", 0.50
 
-# ============= Paper Trading =============
+# ============= State Management =============
+def load_state():
+    if os.path.isfile(STATE_FILE):
+        with open(STATE_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {}
+
+def save_state(state):
+    with open(STATE_FILE, 'w', encoding='utf-8') as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+# ============= Portfolio Management =============
 def load_portfolio():
-    if os.path.isfile(PORTFOLIO_FILE):
-        with open(PORTFOLIO_FILE, 'r', encoding='utf-8') as f:
+    portfolio_file = "portfolio.json"
+    if os.path.isfile(portfolio_file):
+        with open(portfolio_file, 'r', encoding='utf-8') as f:
             return json.load(f)
     return {
         'cash': VIRTUAL_CASH,
@@ -121,18 +122,24 @@ def load_portfolio():
     }
 
 def save_portfolio(portfolio):
-    with open(PORTFOLIO_FILE, 'w', encoding='utf-8') as f:
+    portfolio_file = "portfolio.json"
+    with open(portfolio_file, 'w', encoding='utf-8') as f:
         json.dump(portfolio, f, ensure_ascii=False, indent=2)
 
 def execute_paper_trade(coin_name, decision, price, portfolio):
     trade_action = "لا يوجد تداول"
     
     if decision == "BUY" and portfolio['cash'] >= TRADE_SIZE_USD:
-        qty = TRADE_SIZE_USD / price
-        portfolio['holdings'][coin_name] = portfolio['holdings'].get(coin_name, 0.0) + qty
-        portfolio['cash'] -= TRADE_SIZE_USD
-        portfolio['total_trades'] += 1
-        trade_action = f"شراء {qty:.6f} @ ${price:,.0f}"
+        # التحقق من الحد الأقصى لكل أصل
+        current_value = portfolio['holdings'].get(coin_name, 0.0) * price
+        if current_value >= MAX_PER_ASSET:
+            trade_action = f"تجاوز الحد الأقصى لـ {coin_name} (${MAX_PER_ASSET})"
+        else:
+            qty = TRADE_SIZE_USD / price
+            portfolio['holdings'][coin_name] = portfolio['holdings'].get(coin_name, 0.0) + qty
+            portfolio['cash'] -= TRADE_SIZE_USD
+            portfolio['total_trades'] += 1
+            trade_action = f"شراء {qty:.6f} @ ${price:,.0f}"
         
     elif decision == "SELL" and portfolio['holdings'].get(coin_name, 0.0) > 0:
         qty = portfolio['holdings'][coin_name]
@@ -155,69 +162,47 @@ def calculate_portfolio_value(portfolio, current_prices):
     pnl_pct = (total_pnl / VIRTUAL_CASH) * 100
     return total_value, total_pnl, pnl_pct
 
-# ============= State Management =============
-def get_last_state_from_csv(coin_name):
-    if not os.path.isfile(LOG_FILE):
-        return None
-    try:
-        with open(LOG_FILE, 'r', encoding='utf-8') as f:
-            content = f.read().strip()
-            if not content:
-                return None
-            f.seek(0)
-            reader = csv.DictReader(f)
-            if reader.fieldnames is None or 'coin' not in reader.fieldnames:
-                return None
-            last_row = None
-            for row in reader:
-                if row.get('coin') == coin_name:
-                    last_row = row
-            if last_row is None:
-                return None
-            state = {
-                'price': float(last_row['price'].replace('$', '').replace(',', '')),
-                'rsi': float(last_row['rsi']),
-                'decision': last_row['decision'],
-            }
-            if 'macd' in last_row and last_row['macd'] != 'N/A':
-                try:
-                    state['macd'] = float(last_row['macd'])
-                except (ValueError, TypeError):
-                    state['macd'] = None
-            else:
-                state['macd'] = None
-            return state
-    except Exception as e:
-        print(f"⚠️ Error reading CSV: {e}")
-        return None
-
+# ============= Smart Alerts =============
 def should_send_alert(coin, price, rsi, macd, decision, last_state):
-    if last_state is None:
+    if coin not in last_state:
         return True, "أول تشغيل"
-    last_price = last_state['price']
-    last_decision = last_state['decision']
+    
+    last = last_state[coin]
+    last_price = last['price']
+    last_decision = last['decision']
+    
+    # الشرط 1: تغير القرار
     if decision != last_decision:
         return True, f"تغير القرار من {last_decision} إلى {decision}"
+    
+    # الشرط 2: RSI في منطقة حرجة
     if rsi < 30 or rsi > 75:
         return True, f"RSI حرج ({rsi:.1f})"
+    
+    # الشرط 3: تغير السعر أكثر من 3%
     price_change_pct = abs(price - last_price) / last_price * 100
     if price_change_pct > 3.0:
         return True, f"تغير السعر {price_change_pct:.2f}%"
-    last_macd = last_state.get('macd')
+    
+    # الشرط 4: تحول MACD
+    last_macd = last.get('macd')
     if last_macd is not None and macd is not None:
         if last_macd < 0 and macd > 0:
             return True, "MACD تحول إيجابي"
         elif last_macd > 0 and macd < 0:
             return True, "MACD تحول سلبي"
+    
     return False, None
 
 # ============= Logging =============
 def log_decision(coin, price, rsi, macd, ema_9, ema_21, decision, reason, confidence, trade_action):
     file_exists = os.path.isfile(LOG_FILE) and os.path.getsize(LOG_FILE) > 0
+    
     with open(LOG_FILE, 'a', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         if not file_exists:
             writer.writerow(['timestamp', 'coin', 'price', 'rsi', 'macd', 'ema_9', 'ema_21', 'decision', 'reason', 'confidence', 'trade_action'])
+        
         writer.writerow([
             datetime.now().strftime('%Y-%m-%d %H:%M UTC'),
             coin,
@@ -236,9 +221,12 @@ def log_decision(coin, price, rsi, macd, ema_9, ema_21, decision, reason, confid
 def analyze():
     print("Fetching data and running Paper Trading...")
     
+    # تحميل الحالة السابقة
+    last_state = load_state()
     portfolio = load_portfolio()
     alerts = []
     current_prices = {}
+    new_state = {}
     
     for coin_id, coin_name in [('bitcoin', 'BTC'), ('pax-gold', 'PAXG')]:
         print(f"\n--- {coin_name} ---")
@@ -253,9 +241,7 @@ def analyze():
         ema_9 = calculate_ema(price_history[-20:], 9) if len(price_history) >= 20 else None
         ema_21 = calculate_ema(price_history[-30:], 21) if len(price_history) >= 30 else None
         
-        last_state = get_last_state_from_csv(coin_name)
-        last_rsi = last_state['rsi'] if last_state else None
-        
+        last_rsi = last_state.get(coin_name, {}).get('rsi')
         decision, emoji, reason, confidence = get_decision(rsi, macd, price, ema_9, last_rsi)
         
         trade_action = execute_paper_trade(coin_name, decision, price, portfolio)
@@ -279,10 +265,21 @@ def analyze():
                 'trade_action': trade_action
             })
         
+        # حفظ الحالة الجديدة
+        new_state[coin_name] = {
+            'price': price,
+            'rsi': rsi,
+            'macd': macd,
+            'decision': decision
+        }
+        
         macd_str = f"{macd:.2f}" if macd is not None else "N/A"
         print(f"{coin_name}: ${price:,.0f} | RSI: {rsi:.1f} | MACD: {macd_str} | {decision} | {trade_action}")
     
+    # حفظ الحالة والمحفظة
+    save_state(new_state)
     save_portfolio(portfolio)
+    
     total_value, total_pnl, pnl_pct = calculate_portfolio_value(portfolio, current_prices)
     
     if alerts:
@@ -298,10 +295,10 @@ def analyze():
             if alert['ema_9']:
                 msg_lines.append(f"📈 EMA 9: ${alert['ema_9']:,.0f}")
             msg_lines.append(f"{alert['emoji']} Decision: {alert['decision']}")
-            msg_lines.append(f" Reason: {alert['reason']}")
+            msg_lines.append(f"📝 Reason: {alert['reason']}")
             msg_lines.append(f"🎯 Confidence: {alert['confidence']*100:.0f}%")
             msg_lines.append(f"💼 Trade: {alert['trade_action']}")
-            msg_lines.append(f" Alert: {alert['alert_reason']}")
+            msg_lines.append(f"⚡ Alert: {alert['alert_reason']}")
         
         pnl_emoji = "🟢" if total_pnl >= 0 else "🔴"
         msg_lines.append(f"\n{'━' * 25}")
