@@ -2,17 +2,26 @@ import requests
 import os
 import csv
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # ============= Configuration =============
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = "362387912"
 LOG_FILE = "trading_log.csv"
 STATE_FILE = "last_state.json"
+PORTFOLIO_FILE = "portfolio.json"
 
 VIRTUAL_CASH = 1000.0
 TRADE_SIZE_USD = 50.0
-MAX_PER_ASSET = 300.0  # حد أقصى 30% من المحفظة لكل أصل
+
+# === معايير الشراء الذكية (تعديلك) ===
+MAX_TRADES_PER_ASSET = 5           # حد أقصى 5 صفقات لكل أصل
+MIN_HOURS_BETWEEN_TRADES = 24      # 24 ساعة بين كل صفقة
+MIN_DROP_PERCENT = 3.0             # يجب أن ينخفض السعر 3% عن آخر شراء
+
+# === معايير وقف الخسارة والربح ===
+STOP_LOSS_PERCENT = 8.0            # بيع إذا انخفض 8% عن متوسط الشراء
+TAKE_PROFIT_PERCENT = 15.0         # بيع إذا ارتفع 15% عن متوسط الشراء
 
 # ============= Telegram Bot =============
 class TelegramBot:
@@ -79,19 +88,14 @@ def calculate_rsi(prices, period=14):
 
 # ============= Smart Decision Logic =============
 def get_decision(rsi, macd, price, ema_9, last_rsi=None):
-    # BUY قوي: RSI < 30 (تشبع بيعي)
     if rsi < 30:
-        return "BUY", "", f"RSI منخفض جداً ({rsi:.1f}) - تشبع بيعي", 0.85
-    # BUY متوسط: RSI < 35 + MACD سلبي قوي
+        return "BUY", "🟢", f"RSI منخفض جداً ({rsi:.1f}) - تشبع بيعي", 0.85
     elif rsi < 35 and macd is not None and macd < -50:
         return "BUY", "🟢", f"RSI منخفض ({rsi:.1f}) + MACD سلبي قوي", 0.75
-    # BUY خفيف: RSI < 40 + السعر تحت EMA
     elif rsi < 40 and ema_9 is not None and price < ema_9:
         return "BUY", "🟡", f"RSI ({rsi:.1f}) + السعر تحت EMA 9", 0.65
-    # SELL قوي: RSI > 75
     elif rsi > 75:
         return "SELL", "🔴", f"RSI مرتفع جداً ({rsi:.1f}) - تشبع شرائي", 0.85
-    # SELL متوسط: RSI > 70 + MACD سلبي
     elif rsi > 70 and macd is not None and macd < 0:
         return "SELL", "🔴", f"RSI مرتفع ({rsi:.1f}) + MACD سلبي", 0.75
     else:
@@ -108,47 +112,122 @@ def save_state(state):
     with open(STATE_FILE, 'w', encoding='utf-8') as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
-# ============= Portfolio Management =============
+# ============= Portfolio Management (مع التحسينات الجديدة) =============
 def load_portfolio():
-    portfolio_file = "portfolio.json"
-    if os.path.isfile(portfolio_file):
-        with open(portfolio_file, 'r', encoding='utf-8') as f:
+    if os.path.isfile(PORTFOLIO_FILE):
+        with open(PORTFOLIO_FILE, 'r', encoding='utf-8') as f:
             return json.load(f)
     return {
         'cash': VIRTUAL_CASH,
         'holdings': {'BTC': 0.0, 'PAXG': 0.0},
+        'avg_buy_price': {'BTC': 0.0, 'PAXG': 0.0},
+        'last_buy_price': {'BTC': 0.0, 'PAXG': 0.0},
+        'last_buy_time': {'BTC': None, 'PAXG': None},
+        'trades_count': {'BTC': 0, 'PAXG': 0},
         'total_trades': 0,
         'start_date': datetime.now().strftime('%Y-%m-%d')
     }
 
 def save_portfolio(portfolio):
-    portfolio_file = "portfolio.json"
-    with open(portfolio_file, 'w', encoding='utf-8') as f:
+    with open(PORTFOLIO_FILE, 'w', encoding='utf-8') as f:
         json.dump(portfolio, f, ensure_ascii=False, indent=2)
 
-def execute_paper_trade(coin_name, decision, price, portfolio):
-    trade_action = "لا يوجد تداول"
+def check_stop_loss_take_profit(coin_name, current_price, portfolio):
+    """فحص وقف الخسارة والربح"""
+    avg_price = portfolio['avg_buy_price'].get(coin_name, 0.0)
+    qty = portfolio['holdings'].get(coin_name, 0.0)
     
-    if decision == "BUY" and portfolio['cash'] >= TRADE_SIZE_USD:
-        # التحقق من الحد الأقصى لكل أصل
-        current_value = portfolio['holdings'].get(coin_name, 0.0) * price
-        if current_value >= MAX_PER_ASSET:
-            trade_action = f"تجاوز الحد الأقصى لـ {coin_name} (${MAX_PER_ASSET})"
+    if qty <= 0 or avg_price <= 0:
+        return None, None
+    
+    change_pct = ((current_price - avg_price) / avg_price) * 100
+    
+    if change_pct <= -STOP_LOSS_PERCENT:
+        return "SELL", f"⚠️ STOP-LOSS: انخفض {change_pct:.1f}% عن متوسط الشراء (${avg_price:,.0f})"
+    elif change_pct >= TAKE_PROFIT_PERCENT:
+        return "SELL", f"🎯 TAKE-PROFIT: ارتفع {change_pct:.1f}% عن متوسط الشراء (${avg_price:,.0f})"
+    
+    return None, None
+
+def execute_paper_trade(coin_name, decision, price, portfolio, rsi):
+    """تنفيذ التداول مع جميع القيود الذكية"""
+    trade_action = "لا يوجد تداول"
+    rejection_reason = None
+    
+    # === الفحص 1: Stop-Loss / Take-Profit (أولوية قصوى) ===
+    sl_tp_decision, sl_tp_reason = check_stop_loss_take_profit(coin_name, price, portfolio)
+    if sl_tp_decision == "SELL" and portfolio['holdings'].get(coin_name, 0.0) > 0:
+        qty = portfolio['holdings'][coin_name]
+        sell_value = qty * price
+        portfolio['cash'] += sell_value
+        portfolio['holdings'][coin_name] = 0.0
+        portfolio['avg_buy_price'][coin_name] = 0.0
+        portfolio['total_trades'] += 1
+        trade_action = f"بيع {sl_tp_reason} @ ${price:,.0f} (قيمة: ${sell_value:,.0f})"
+        return trade_action
+    
+    # === الفحص 2: قرار الشراء ===
+    if decision == "BUY":
+        # الفحص أ: الحد الأقصى للصفقات
+        if portfolio['trades_count'].get(coin_name, 0) >= MAX_TRADES_PER_ASSET:
+            rejection_reason = f"تجاوز الحد الأقصى ({MAX_TRADES_PER_ASSET} صفقة)"
+        
+        # الفحص ب: الكاش المتاح
+        elif portfolio['cash'] < TRADE_SIZE_USD:
+            rejection_reason = f"كاش غير كافٍ (${portfolio['cash']:.0f} < ${TRADE_SIZE_USD})"
+        
+        # الفحص ج: الوقت بين الصفقات
         else:
+            last_time_str = portfolio['last_buy_time'].get(coin_name)
+            if last_time_str:
+                last_time = datetime.fromisoformat(last_time_str)
+                hours_since = (datetime.now() - last_time).total_seconds() / 3600
+                if hours_since < MIN_HOURS_BETWEEN_TRADES:
+                    rejection_reason = f"انتظار {MIN_HOURS_BETWEEN_TRADES}س (مرت {hours_since:.0f}س فقط)"
+            
+            # الفحص د: الانخفاض الكافي عن آخر سعر شراء (تعديلك الذكي!)
+            if not rejection_reason:
+                last_price = portfolio['last_buy_price'].get(coin_name, 0.0)
+                if last_price > 0:
+                    drop_pct = ((last_price - price) / last_price) * 100
+                    if drop_pct < MIN_DROP_PERCENT:
+                        rejection_reason = f"انخفاض غير كافٍ ({drop_pct:.1f}% < {MIN_DROP_PERCENT}%) - انتظر مستوى أقل"
+        
+        # تنفيذ الشراء إذا لم يكن هناك رفض
+        if not rejection_reason:
             qty = TRADE_SIZE_USD / price
             portfolio['holdings'][coin_name] = portfolio['holdings'].get(coin_name, 0.0) + qty
             portfolio['cash'] -= TRADE_SIZE_USD
             portfolio['total_trades'] += 1
-            trade_action = f"شراء {qty:.6f} @ ${price:,.0f}"
-        
+            portfolio['trades_count'][coin_name] = portfolio['trades_count'].get(coin_name, 0) + 1
+            
+            # تحديث متوسط سعر الشراء
+            old_qty = portfolio['holdings'][coin_name] - qty
+            old_avg = portfolio['avg_buy_price'].get(coin_name, 0.0)
+            if old_qty > 0:
+                total_value = (old_qty * old_avg) + (qty * price)
+                portfolio['avg_buy_price'][coin_name] = total_value / portfolio['holdings'][coin_name]
+            else:
+                portfolio['avg_buy_price'][coin_name] = price
+            
+            # تحديث آخر سعر ووقت شراء
+            portfolio['last_buy_price'][coin_name] = price
+            portfolio['last_buy_time'][coin_name] = datetime.now().isoformat()
+            
+            trade_action = f"شراء {qty:.6f} @ ${price:,.0f} (متوسط: ${portfolio['avg_buy_price'][coin_name]:,.0f})"
+        else:
+            trade_action = f"رُفض: {rejection_reason}"
+    
+    # === الفحص 3: قرار البيع العادي (RSI > 75) ===
     elif decision == "SELL" and portfolio['holdings'].get(coin_name, 0.0) > 0:
         qty = portfolio['holdings'][coin_name]
         sell_value = qty * price
         portfolio['cash'] += sell_value
         portfolio['holdings'][coin_name] = 0.0
+        portfolio['avg_buy_price'][coin_name] = 0.0
         portfolio['total_trades'] += 1
         trade_action = f"بيع {qty:.6f} @ ${price:,.0f} (قيمة: ${sell_value:,.0f})"
-        
+    
     return trade_action
 
 def calculate_portfolio_value(portfolio, current_prices):
@@ -171,20 +250,16 @@ def should_send_alert(coin, price, rsi, macd, decision, last_state):
     last_price = last['price']
     last_decision = last['decision']
     
-    # الشرط 1: تغير القرار
     if decision != last_decision:
         return True, f"تغير القرار من {last_decision} إلى {decision}"
     
-    # الشرط 2: RSI في منطقة حرجة
     if rsi < 30 or rsi > 75:
         return True, f"RSI حرج ({rsi:.1f})"
     
-    # الشرط 3: تغير السعر أكثر من 3%
     price_change_pct = abs(price - last_price) / last_price * 100
     if price_change_pct > 3.0:
         return True, f"تغير السعر {price_change_pct:.2f}%"
     
-    # الشرط 4: تحول MACD
     last_macd = last.get('macd')
     if last_macd is not None and macd is not None:
         if last_macd < 0 and macd > 0:
@@ -197,12 +272,10 @@ def should_send_alert(coin, price, rsi, macd, decision, last_state):
 # ============= Logging =============
 def log_decision(coin, price, rsi, macd, ema_9, ema_21, decision, reason, confidence, trade_action):
     file_exists = os.path.isfile(LOG_FILE) and os.path.getsize(LOG_FILE) > 0
-    
     with open(LOG_FILE, 'a', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         if not file_exists:
             writer.writerow(['timestamp', 'coin', 'price', 'rsi', 'macd', 'ema_9', 'ema_21', 'decision', 'reason', 'confidence', 'trade_action'])
-        
         writer.writerow([
             datetime.now().strftime('%Y-%m-%d %H:%M UTC'),
             coin,
@@ -219,9 +292,8 @@ def log_decision(coin, price, rsi, macd, ema_9, ema_21, decision, reason, confid
 
 # ============= Main Analysis =============
 def analyze():
-    print("Fetching data and running Paper Trading...")
+    print("Fetching data and running Smart Paper Trading...")
     
-    # تحميل الحالة السابقة
     last_state = load_state()
     portfolio = load_portfolio()
     alerts = []
@@ -244,11 +316,21 @@ def analyze():
         last_rsi = last_state.get(coin_name, {}).get('rsi')
         decision, emoji, reason, confidence = get_decision(rsi, macd, price, ema_9, last_rsi)
         
-        trade_action = execute_paper_trade(coin_name, decision, price, portfolio)
+        trade_action = execute_paper_trade(coin_name, decision, price, portfolio, rsi)
         
         log_decision(coin_name, price, rsi, macd, ema_9, ema_21, decision, reason, confidence, trade_action)
         
         should_alert, alert_reason = should_send_alert(coin_name, price, rsi, macd, decision, last_state)
+        
+        # تنبيه إضافي عند رفض صفقة
+        if "رُفض" in trade_action:
+            should_alert = True
+            alert_reason = trade_action
+        
+        # تنبيه عند Stop-Loss أو Take-Profit
+        if "STOP-LOSS" in trade_action or "TAKE-PROFIT" in trade_action:
+            should_alert = True
+            alert_reason = trade_action
         
         if should_alert:
             alerts.append({
@@ -265,7 +347,6 @@ def analyze():
                 'trade_action': trade_action
             })
         
-        # حفظ الحالة الجديدة
         new_state[coin_name] = {
             'price': price,
             'rsi': rsi,
@@ -274,9 +355,11 @@ def analyze():
         }
         
         macd_str = f"{macd:.2f}" if macd is not None else "N/A"
-        print(f"{coin_name}: ${price:,.0f} | RSI: {rsi:.1f} | MACD: {macd_str} | {decision} | {trade_action}")
+        trades_count = portfolio['trades_count'].get(coin_name, 0)
+        avg_price = portfolio['avg_buy_price'].get(coin_name, 0.0)
+        print(f"{coin_name}: ${price:,.0f} | RSI: {rsi:.1f} | MACD: {macd_str} | {decision}")
+        print(f"  Trades: {trades_count}/{MAX_TRADES_PER_ASSET} | Avg: ${avg_price:,.0f} | {trade_action}")
     
-    # حفظ الحالة والمحفظة
     save_state(new_state)
     save_portfolio(portfolio)
     
@@ -302,7 +385,7 @@ def analyze():
         
         pnl_emoji = "🟢" if total_pnl >= 0 else "🔴"
         msg_lines.append(f"\n{'━' * 25}")
-        msg_lines.append(f" <b>Portfolio Value:</b> ${total_value:,.2f}")
+        msg_lines.append(f"💰 <b>Portfolio Value:</b> ${total_value:,.2f}")
         msg_lines.append(f"📈 <b>Total PnL:</b> {pnl_emoji} ${total_pnl:+,.2f} ({pnl_pct:+.2f}%)")
         msg_lines.append(f"🔄 <b>Total Trades:</b> {portfolio['total_trades']}")
         msg_lines.append(f"⏰ {timestamp}")
@@ -311,7 +394,7 @@ def analyze():
         success = tg.send(msg)
         print(f"\n🚨 Alert sent: {success}")
     else:
-        print("\n No alert needed - market stable")
+        print("\n💤 No alert needed - market stable")
 
 if __name__ == "__main__":
     analyze()
