@@ -1,14 +1,14 @@
 {
   "BTC": {
-    "price": 61467,
-    "rsi": 55.0,
-    "macd": 298.0,
-    "decision": "HOLD"
+    "price": 61684,
+    "rsi": 81.10595837489441,
+    "macd": 344.4120962749148,
+    "decision": "SELL"
   },
   "PAXG": {
-    "price": 3621,
-    "rsi": 55.0,
-    "macd": 10.0,
-    "decision": "HOLD"
+    "price": 3648.77,
+    "rsi": 88.85460893321479,
+    "macd": 21.15015143701021,
+    "decision": "SELL"
   }
 }
