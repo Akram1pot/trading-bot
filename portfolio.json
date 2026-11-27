@@ -1,25 +1,25 @@
 {
-  "cash": 1000.0,
+  "cash": 960.0,
   "holdings": {
-    "BTC": 0.0,
+    "BTC": 0.0006679134384183809,
     "PAXG": 0.0
   },
   "avg_buy_price": {
-    "BTC": 0.0,
+    "BTC": 59888,
     "PAXG": 0.0
   },
   "last_buy_price": {
-    "BTC": 0.0,
+    "BTC": 59888,
     "PAXG": 0.0
   },
   "last_buy_time": {
-    "BTC": null,
+    "BTC": "2026-11-27T17:11:25.548692",
     "PAXG": null
   },
   "trades_count": {
-    "BTC": 0,
+    "BTC": 1,
     "PAXG": 0
   },
-  "total_trades": 0,
+  "total_trades": 1,
   "start_date": "2026-11-26"
 }
